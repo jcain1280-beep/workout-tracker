@@ -1,17 +1,23 @@
-//
-//  Workout_TrackerApp.swift
-//  Workout Tracker
-//
-//  Created by Jonathan cain on 3/28/26.
-//
-
 import SwiftUI
+import GoogleSignIn
 
 @main
 struct Workout_TrackerApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+
     var body: some Scene {
         WindowGroup {
             ContentView()
         }
+    }
+}
+
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    func application(
+        _ app: UIApplication,
+        open url: URL,
+        options: [UIApplication.OpenURLOptionsKey : Any] = [:]
+    ) -> Bool {
+        GIDSignIn.sharedInstance.handle(url)
     }
 }
