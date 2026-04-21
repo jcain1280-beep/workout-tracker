@@ -469,12 +469,27 @@ final class WorkoutStore: ObservableObject {
         workoutsForLastWeek().count
     }
 
-    func thisWeekWorkoutMinutes() -> Int {
-        workoutsForThisWeek().map(\.minutes).reduce(0, +)
+    func recentWorkoutNames(limit: Int = 8) -> [String] {
+        Array(uniqueWorkoutNames(from: loggedWorkouts).prefix(limit))
     }
 
-    func lastWeekWorkoutMinutes() -> Int {
-        workoutsForLastWeek().map(\.minutes).reduce(0, +)
+    private func uniqueWorkoutNames(from workouts: [LoggedWorkout]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+
+        for workout in workouts {
+            let cleanName = workout.workoutName
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+
+            let key = cleanName.lowercased()
+
+            guard !key.isEmpty, !seen.contains(key) else { continue }
+
+            seen.insert(key)
+            result.append(cleanName)
+        }
+
+        return result
     }
 
     @discardableResult
@@ -1026,6 +1041,8 @@ struct HomeTileDropDelegate: DropDelegate {
 
 struct HomeView: View {
     @EnvironmentObject private var store: WorkoutStore
+    @EnvironmentObject private var calendarService: GoogleCalendarService
+
     @Binding var selectedTab: ContentView.AppTab
     @Binding var selectedCategoryID: UUID?
     @Binding var showingAddWorkout: Bool
@@ -1042,12 +1059,8 @@ struct HomeView: View {
         store.lastWeekWorkoutCount()
     }
 
-    private var thisWeekMinutes: Int {
-        store.thisWeekWorkoutMinutes()
-    }
-
-    private var lastWeekMinutes: Int {
-        store.lastWeekWorkoutMinutes()
+    private var recentWorkoutNames: [String] {
+        store.recentWorkoutNames(limit: 8)
     }
 
     var body: some View {
@@ -1061,27 +1074,35 @@ struct HomeView: View {
                 .ignoresSafeArea()
 
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 20) {
+                    VStack(alignment: .leading, spacing: 16) {
                         Text("Muscle Metrics")
                             .font(.system(size: 36, weight: .bold, design: .rounded))
 
+                        if let banner = store.homeBannerMessage {
+                            Text(banner)
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 10)
+                                .background(.ultraThinMaterial.opacity(0.25), in: Capsule())
+                        }
+
                         HStack(spacing: 14) {
-                            ComparisonStatCard(
-                                title: "Workouts",
-                                topLabel: "This Week",
-                                topValue: "\(thisWeekWorkoutCount)",
-                                bottomLabel: "Last Week",
-                                bottomValue: "\(lastWeekWorkoutCount)"
+                            CompactStatCard(
+                                title: "This Week",
+                                count: thisWeekWorkoutCount
                             )
 
-                            ComparisonStatCard(
-                                title: "Minutes",
-                                topLabel: "This Week",
-                                topValue: "\(thisWeekMinutes)",
-                                bottomLabel: "Last Week",
-                                bottomValue: "\(lastWeekMinutes)"
+                            CompactStatCard(
+                                title: "Last Week",
+                                count: lastWeekWorkoutCount
                             )
                         }
+
+                        ActivityChipsCard(
+                            title: "Recent Activity",
+                            workouts: recentWorkoutNames
+                        )
 
                         HStack {
                             Text("Workouts")
@@ -1158,6 +1179,20 @@ struct HomeView: View {
                         }
                     }
                     .padding()
+                }
+                .refreshable {
+                    guard calendarService.isSignedIn else {
+                        store.showHomeBanner("Connect Google Calendar in Settings first.")
+                        return
+                    }
+
+                    do {
+                        let imported = try await calendarService.importWorkoutsFromCalendar(range: store.calendarSyncRange)
+                        store.reconcileWithCalendar(imported)
+                        store.showHomeBanner("Calendar refreshed.")
+                    } catch {
+                        store.showHomeBanner("Calendar refresh failed.")
+                    }
                 }
             }
             .navigationBarHidden(true)
@@ -1489,8 +1524,12 @@ struct HistoryView: View {
     @State private var expandedWeeks: Set<String> = []
     @State private var deleteMessage = ""
 
-    private var filtered: [LoggedWorkout] {
-        store.loggedWorkouts
+    private var recentWorkouts: [LoggedWorkout] {
+        Array(store.loggedWorkouts.prefix(5))
+    }
+
+    private var remainingWorkouts: [LoggedWorkout] {
+        Array(store.loggedWorkouts.dropFirst(5))
     }
 
     private var monthSections: [MonthSection] {
@@ -1501,7 +1540,7 @@ struct HistoryView: View {
         let weekFormatter = DateFormatter()
         weekFormatter.dateFormat = "MMM d"
 
-        let groupedByMonth = Dictionary(grouping: filtered) {
+        let groupedByMonth = Dictionary(grouping: remainingWorkouts) {
             let comps = calendar.dateComponents([.year, .month], from: $0.date)
             return "\(comps.year ?? 0)-\(comps.month ?? 0)"
         }
@@ -1544,75 +1583,114 @@ struct HistoryView: View {
 
     var body: some View {
         NavigationStack {
-            ZStack {
-                LinearGradient(
-                    colors: [.black, Color(red: 0.10, green: 0.10, blue: 0.14)],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-                .ignoresSafeArea()
+            ScrollViewReader { proxy in
+                ZStack {
+                    LinearGradient(
+                        colors: [.black, Color(red: 0.10, green: 0.10, blue: 0.14)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .ignoresSafeArea()
 
-                VStack(spacing: 12) {
-                    if !deleteMessage.isEmpty {
-                        Text(deleteMessage)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal)
-                            .padding(.top)
-                    }
+                    VStack(spacing: 12) {
+                        if !deleteMessage.isEmpty {
+                            Text(deleteMessage)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal)
+                                .padding(.top)
+                        }
 
-                    if filtered.isEmpty {
-                        EmptyStateCard(title: "No workout history", subtitle: "Your completed workouts will appear here.")
-                            .padding()
-                        Spacer()
-                    } else {
-                        List {
-                            ForEach(monthSections) { month in
-                                Section {
-                                    DisclosureGroup(
-                                        isExpanded: Binding(
-                                            get: { expandedMonths.contains(month.id) },
-                                            set: { isExpanded in
-                                                if isExpanded { expandedMonths.insert(month.id) }
-                                                else { expandedMonths.remove(month.id) }
-                                            }
-                                        )
-                                    ) {
-                                        ForEach(month.weeks) { week in
-                                            DisclosureGroup(
-                                                isExpanded: Binding(
-                                                    get: { expandedWeeks.contains(week.id) },
-                                                    set: { isExpanded in
-                                                        if isExpanded { expandedWeeks.insert(week.id) }
-                                                        else { expandedWeeks.remove(week.id) }
+                        if store.loggedWorkouts.isEmpty {
+                            EmptyStateCard(title: "No workout history", subtitle: "Your completed workouts will appear here.")
+                                .padding()
+                            Spacer()
+                        } else {
+                            List {
+                                if !recentWorkouts.isEmpty {
+                                    Section {
+                                        ForEach(recentWorkouts) { workout in
+                                            WorkoutLogCard(workout: workout)
+                                                .listRowBackground(Color.clear)
+                                                .swipeActions {
+                                                    Button(role: .destructive) {
+                                                        Task { await deleteWorkout(workout) }
+                                                    } label: {
+                                                        Label("Delete", systemImage: "trash")
                                                     }
-                                                )
-                                            ) {
-                                                ForEach(week.workouts) { workout in
-                                                    WorkoutLogCard(workout: workout)
-                                                        .swipeActions {
-                                                            Button(role: .destructive) {
-                                                                Task { await deleteWorkout(workout) }
-                                                            } label: {
-                                                                Label("Delete", systemImage: "trash")
-                                                            }
-                                                        }
                                                 }
-                                            } label: {
-                                                Text(week.title)
-                                                    .font(.subheadline.weight(.semibold))
-                                            }
                                         }
-                                    } label: {
-                                        Text(month.title)
-                                            .font(.headline)
+                                    } header: {
+                                        Text("Recent Workouts")
                                     }
                                 }
-                                .listRowBackground(Color.clear)
+
+                                ForEach(monthSections) { month in
+                                    Section {
+                                        DisclosureGroup(
+                                            isExpanded: Binding(
+                                                get: { expandedMonths.contains(month.id) },
+                                                set: { isExpanded in
+                                                    if isExpanded {
+                                                        expandedMonths.insert(month.id)
+                                                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                                                            withAnimation {
+                                                                proxy.scrollTo(month.id, anchor: .top)
+                                                            }
+                                                        }
+                                                    } else {
+                                                        expandedMonths.remove(month.id)
+                                                    }
+                                                }
+                                            )
+                                        ) {
+                                            ForEach(month.weeks) { week in
+                                                DisclosureGroup(
+                                                    isExpanded: Binding(
+                                                        get: { expandedWeeks.contains(week.id) },
+                                                        set: { isExpanded in
+                                                            if isExpanded {
+                                                                expandedWeeks.insert(week.id)
+                                                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                                                                    withAnimation {
+                                                                        proxy.scrollTo(week.id, anchor: .top)
+                                                                    }
+                                                                }
+                                                            } else {
+                                                                expandedWeeks.remove(week.id)
+                                                            }
+                                                        }
+                                                    )
+                                                ) {
+                                                    ForEach(week.workouts) { workout in
+                                                        WorkoutLogCard(workout: workout)
+                                                            .listRowBackground(Color.clear)
+                                                            .swipeActions {
+                                                                Button(role: .destructive) {
+                                                                    Task { await deleteWorkout(workout) }
+                                                                } label: {
+                                                                    Label("Delete", systemImage: "trash")
+                                                                }
+                                                            }
+                                                    }
+                                                } label: {
+                                                    Text(week.title)
+                                                        .font(.subheadline.weight(.semibold))
+                                                        .id(week.id)
+                                                }
+                                            }
+                                        } label: {
+                                            Text(month.title)
+                                                .font(.headline)
+                                                .id(month.id)
+                                        }
+                                    }
+                                    .listRowBackground(Color.clear)
+                                }
                             }
+                            .listStyle(.plain)
+                            .scrollContentBackground(.hidden)
                         }
-                        .listStyle(.plain)
-                        .scrollContentBackground(.hidden)
                     }
                 }
             }
@@ -2205,26 +2283,77 @@ struct EditWorkoutTypeSheet: View {
 }
 
 // MARK: - Reusable Views
-
-struct StatCard: View {
+struct CompactStatCard: View {
     let title: String
-    let value: String
-    let subtitle: String
+    let count: Int
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(title)
                 .foregroundStyle(.secondary)
+                .font(.subheadline)
 
-            Text(value)
+            Text("\(count)")
                 .font(.system(size: 30, weight: .bold, design: .rounded))
 
-            Text(subtitle)
+            Text(count == 1 ? "workout" : "workouts")
+                .font(.caption)
                 .foregroundStyle(.secondary)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, minHeight: 96, alignment: .topLeading)
         .padding()
-        .background(.ultraThinMaterial.opacity(0.22), in: RoundedRectangle(cornerRadius: 22))
+        .background(.ultraThinMaterial.opacity(0.22), in: RoundedRectangle(cornerRadius: 20))
+    }
+}
+
+struct ActivityChipsCard: View {
+    let title: String
+    let workouts: [String]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(title)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
+            if workouts.isEmpty {
+                Text("No workouts yet")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            } else {
+                FlexibleChipsView(items: workouts)
+            }
+        }
+        .padding()
+        .background(.ultraThinMaterial.opacity(0.18), in: RoundedRectangle(cornerRadius: 20))
+    }
+}
+
+struct FlexibleChipsView: View {
+    let items: [String]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(chunked(items, size: 3), id: \.self) { row in
+                HStack(spacing: 8) {
+                    ForEach(row, id: \.self) { item in
+                        Text(item)
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.white.opacity(0.92))
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(Color.white.opacity(0.08), in: Capsule())
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+    }
+
+    private func chunked(_ array: [String], size: Int) -> [[String]] {
+        stride(from: 0, to: array.count, by: size).map {
+            Array(array[$0..<min($0 + size, array.count)])
+        }
     }
 }
 
@@ -2276,51 +2405,7 @@ struct WorkoutLogCard: View {
         .background(.ultraThinMaterial.opacity(0.18), in: RoundedRectangle(cornerRadius: 22))
     }
 }
-struct ComparisonStatCard: View {
-    let title: String
-    let topLabel: String
-    let topValue: String
-    let bottomLabel: String
-    let bottomValue: String
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(title)
-                .foregroundStyle(.secondary)
-                .font(.headline)
-
-            VStack(spacing: 10) {
-                HStack {
-                    Text(topLabel)
-                        .foregroundStyle(.secondary)
-                        .font(.subheadline)
-
-                    Spacer()
-
-                    Text(topValue)
-                        .font(.title2.bold())
-                }
-
-                Divider()
-                    .overlay(Color.white.opacity(0.12))
-
-                HStack {
-                    Text(bottomLabel)
-                        .foregroundStyle(.secondary)
-                        .font(.subheadline)
-
-                    Spacer()
-
-                    Text(bottomValue)
-                        .font(.title3.bold())
-                }
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding()
-        .background(.ultraThinMaterial.opacity(0.22), in: RoundedRectangle(cornerRadius: 22))
-    }
-}
 struct EmptyStateCard: View {
     let title: String
     let subtitle: String
@@ -2340,24 +2425,6 @@ struct EmptyStateCard: View {
         .frame(maxWidth: .infinity)
         .padding(28)
         .background(.ultraThinMaterial.opacity(0.16), in: RoundedRectangle(cornerRadius: 24))
-    }
-}
-
-struct FilterChip: View {
-    let title: String
-    let isSelected: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Text(title)
-                .font(.subheadline.weight(.semibold))
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                .background(isSelected ? Color.white.opacity(0.16) : Color.white.opacity(0.07))
-                .clipShape(Capsule())
-        }
-        .buttonStyle(.plain)
     }
 }
 
